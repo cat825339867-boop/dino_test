@@ -241,7 +241,8 @@ def extract_patch_tokens(extractor, image: Image.Image) -> dict[str, Any]:
             f"prefix_token_count={prefix_token_count}"
         )
 
-    token_grid = patch_tokens.reshape(1, grid_h, grid_w, -1).squeeze(0).cpu()
+    # 保持 token 留在当前计算设备上，避免后续匹配阶段频繁在 CPU / GPU 间搬运。
+    token_grid = patch_tokens.reshape(1, grid_h, grid_w, -1).squeeze(0).contiguous()
 
     logger.info(
         "patch token 提取完成: original=(%s,%s), padded=(%s,%s), patch=%s, grid=(%s,%s), dim=%s",
@@ -270,9 +271,19 @@ def compute_similarity_map(
     big_tokens: torch.Tensor,
     query_tokens: torch.Tensor,
     topk_ratio: float = 0.6,
+    window_batch_size: int = 2048,
+    unfold_row_batch_size: int = 16,
 ) -> tuple[list[dict[str, Any]], np.ndarray]:
     """
     在大图 token 网格上滑动小图 token 网格，计算每个位置的鲁棒匹配分数。
+
+    实现说明：
+    - 这里改成了张量化版本，不再对每个候选位置做 Python 双层滑窗
+    - 不再对整张大图一次性 unfold，避免显存峰值过高
+    - 改成按“若干输出行”为一块，分块 unfold
+    - 每个 unfold 块内部再按 window_batch_size 做二级分块计算逐 patch 相似度与 top-k 平均
+
+    这样可以显著减少 Python 循环开销，同时把显存占用控制在更稳定的范围内。
     """
     big_h, big_w, dim = big_tokens.shape
     query_h, query_w, query_dim = query_tokens.shape
@@ -283,33 +294,81 @@ def compute_similarity_map(
         raise ValueError(
             f"小图 token 网格大于大图 token 网格: query=({query_h},{query_w}), big=({big_h},{big_w})"
         )
+    if window_batch_size <= 0:
+        raise ValueError(f"window_batch_size 必须大于 0，当前值: {window_batch_size}")
+    if unfold_row_batch_size <= 0:
+        raise ValueError(
+            f"unfold_row_batch_size 必须大于 0，当前值: {unfold_row_batch_size}"
+        )
 
-    candidates: list[dict[str, Any]] = []
-    total_positions = (big_h - query_h + 1) * (big_w - query_w + 1)
-    score_map = np.zeros((big_h - query_h + 1, big_w - query_w + 1), dtype=np.float32)
+    out_h = big_h - query_h + 1
+    out_w = big_w - query_w + 1
+    total_positions = out_h * out_w
+    query_patch_count = query_h * query_w
+    topk_count = max(1, int(round(query_patch_count * topk_ratio)))
+
     logger.info("开始密集匹配，总 token 位置数量: %s", total_positions)
 
+    device = big_tokens.device
+    big_tokens_nchw = big_tokens.permute(2, 0, 1).unsqueeze(0).contiguous()
+
+    # query token 展平成 (patch_count, dim)，与 unfold 后窗口里的 patch 顺序对齐。
+    query_flat = query_tokens.reshape(query_patch_count, dim).contiguous()
+
+    all_scores = torch.empty(total_positions, dtype=torch.float32, device=device)
     processed = 0
-    for top in range(big_h - query_h + 1):
-        for left in range(big_w - query_w + 1):
-            region = big_tokens[top:top + query_h, left:left + query_w, :]
-            score = compute_region_score(
-                region=region,
-                query_tokens=query_tokens,
-                topk_ratio=topk_ratio,
-            )
-            score_map[top, left] = score
 
-            candidates.append(
-                {
-                    "score": score,
-                    "token_box": [left, top, left + query_w, top + query_h],
-                }
-            )
+    for row_start in range(0, out_h, unfold_row_batch_size):
+        row_count = min(unfold_row_batch_size, out_h - row_start)
 
-            processed += 1
-            if processed % 200 == 0:
+        # 为了生成 row_count 行输出窗口，输入需要覆盖 row_count + query_h - 1 行。
+        row_slice = big_tokens_nchw[:, :, row_start:row_start + row_count + query_h - 1, :]
+        unfolded_chunk = F.unfold(
+            row_slice,
+            kernel_size=(query_h, query_w),
+            stride=1,
+        ).squeeze(0).transpose(0, 1).contiguous()
+
+        chunk_window_count = unfolded_chunk.shape[0]
+        chunk_global_start = row_start * out_w
+
+        for chunk_offset in range(0, chunk_window_count, window_batch_size):
+            chunk_end = min(chunk_offset + window_batch_size, chunk_window_count)
+            batch_windows = unfolded_chunk[chunk_offset:chunk_end]
+
+            # reshape 成 (batch, patch_count, dim)，方便与 query 做逐 patch 点积。
+            batch_windows = batch_windows.reshape(-1, dim, query_patch_count).permute(0, 2, 1)
+
+            # 因为 token 已做过 L2 normalize，所以点积就是余弦相似度。
+            patch_scores = torch.sum(batch_windows * query_flat.unsqueeze(0), dim=-1)
+            topk_scores = torch.topk(patch_scores, k=topk_count, dim=1).values
+            batch_scores = topk_scores.mean(dim=1).to(dtype=torch.float32)
+
+            global_start = chunk_global_start + chunk_offset
+            global_end = global_start + (chunk_end - chunk_offset)
+            all_scores[global_start:global_end] = batch_scores
+
+            processed = global_end
+            if processed % 200 == 0 or processed == total_positions:
                 logger.info("密集匹配进度: %s / %s", processed, total_positions)
+
+        # 显式释放当前 unfold 块的引用，帮助显存尽快回收。
+        del unfolded_chunk
+
+    # 后续热力图和 Python 后处理需要 CPU / numpy，这里统一搬运一次即可。
+    all_scores_cpu = all_scores.detach().cpu()
+    score_map = all_scores_cpu.numpy().reshape(out_h, out_w)
+
+    candidates: list[dict[str, Any]] = []
+    for index, score in enumerate(all_scores_cpu.tolist()):
+        top = index // out_w
+        left = index % out_w
+        candidates.append(
+            {
+                "score": float(score),
+                "token_box": [left, top, left + query_w, top + query_h],
+            }
+        )
 
     return candidates, score_map
 
