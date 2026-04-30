@@ -9,7 +9,9 @@ from transformers import AutoImageProcessor, AutoModel
 
 
 logger = logging.getLogger(__name__)
-DEFAULT_DINO_MODEL_DIR = "/home/ubuntu/.cache/modelscope/hub/models/facebook/dinov3-vitl16-pretrain-lvd1689m"
+# DEFAULT_MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+DEFAULT_MODEL_NAME = "facebook/dinov3-vitb16-pretrain-lvd1689m"
+# DEFAULT_MODEL_NAME = "facebook/dinov3-vits16-pretrain-lvd1689m"
 
 
 class DinoV3Extractor:
@@ -123,43 +125,58 @@ class DinoV3Extractor:
         return features, valid_paths
 
 
-def resolve_local_dino_model_dir() -> str:
+def resolve_local_dino_model_dir(model_name: str = DEFAULT_MODEL_NAME) -> str:
     """
-    解析本地 DINO 模型目录。
-
-    规则：
-    - 优先读取环境变量 DINO_MODEL_DIR
-    - 如果未设置，则使用默认目录 DEFAULT_DINO_MODEL_DIR
-    - 不再自动搜索多个缓存目录，避免路径来源不明确
+    优先解析本地 DINO 模型目录，避免离线环境访问远端。
+    支持通过环境变量 DINO_MODEL_DIR 显式指定。
     """
-    model_dir = os.getenv("DINO_MODEL_DIR", DEFAULT_DINO_MODEL_DIR).strip()
-    if not model_dir:
-        raise ValueError(
-            "DINO_MODEL_DIR 为空，且默认模型目录也为空，请检查配置。"
-        )
+    env_dir = os.getenv("DINO_MODEL_DIR")
+    candidate_dirs = []
 
-    if not os.path.isdir(model_dir):
-        raise FileNotFoundError(
-            "DINO 模型目录不存在。\n"
-            f"当前使用目录: {model_dir}\n"
-            "请设置环境变量 DINO_MODEL_DIR，或确认默认目录是否正确。"
-        )
+    if env_dir:
+        candidate_dirs.append(env_dir)
 
-    has_config = os.path.exists(os.path.join(model_dir, "config.json"))
-    has_weight = (
-        os.path.exists(os.path.join(model_dir, "model.safetensors"))
-        or os.path.exists(os.path.join(model_dir, "pytorch_model.bin"))
+    home_dir = os.path.expanduser("~")
+    candidate_dirs.extend([
+        os.path.join(home_dir, ".cache", "modelscope", "hub", model_name),
+        os.path.join(home_dir, ".cache", "modelscope", "hub", "facebook", "dinov3-vitl16-pretrain-lvd1689m"),
+        os.path.join(home_dir, ".cache", "modelscope", "hub", "models", model_name),
+        os.path.join(home_dir, ".cache", "modelscope", "hub", "models", "facebook", "dinov3-vitl16-pretrain-lvd1689m"),
+        os.path.join(home_dir, ".cache", "huggingface", "hub", "models--facebook--dinov3-vitl16-pretrain-lvd1689m"),
+    ])
+
+    hf_snapshot_root = os.path.join(
+        home_dir,
+        ".cache",
+        "huggingface",
+        "hub",
+        "models--facebook--dinov3-vitl16-pretrain-lvd1689m",
+        "snapshots",
     )
-    if not has_config or not has_weight:
-        raise FileNotFoundError(
-            "DINO 模型目录缺少必要文件。\n"
-            f"当前使用目录: {model_dir}\n"
-            f"config.json 存在: {has_config}\n"
-            f"权重文件存在: {has_weight}"
+    if os.path.isdir(hf_snapshot_root):
+        for snapshot_name in os.listdir(hf_snapshot_root):
+            candidate_dirs.append(os.path.join(hf_snapshot_root, snapshot_name))
+
+    for candidate in candidate_dirs:
+        if not candidate or not os.path.isdir(candidate):
+            continue
+
+        has_config = os.path.exists(os.path.join(candidate, "config.json"))
+        has_weight = (
+            os.path.exists(os.path.join(candidate, "model.safetensors"))
+            or os.path.exists(os.path.join(candidate, "pytorch_model.bin"))
         )
 
-    logger.info("使用本地 DINO 模型目录: %s", model_dir)
-    return model_dir
+        if has_config and has_weight:
+            logger.info("使用本地 DINO 模型目录: %s", candidate)
+            return candidate
+
+    searched = "\n".join(f"- {path}" for path in candidate_dirs)
+    raise FileNotFoundError(
+        "未找到可用的本地 DINO 模型目录。\n"
+        "请设置环境变量 DINO_MODEL_DIR，或确认以下路径中存在完整模型：\n"
+        f"{searched}"
+    )
 
 
 def build_default_extractor() -> DinoV3Extractor:
@@ -175,7 +192,7 @@ def build_default_extractor() -> DinoV3Extractor:
 # =========================
 if __name__ == "__main__":
 
-    # 默认读取环境变量 DINO_MODEL_DIR，未设置时回落到 DEFAULT_DINO_MODEL_DIR
+    # 👉 改成你的模型路径
     model_path = resolve_local_dino_model_dir()
 
     extractor = DinoV3Extractor(model_path)

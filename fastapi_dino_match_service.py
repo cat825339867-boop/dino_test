@@ -87,6 +87,7 @@ def convert_cv2_frame_to_rgb_image(frame: np.ndarray) -> Image.Image:
 def save_annotated_frame_image(
     frame_image: Image.Image,
     best_box: list[int],
+    is_match_confident: bool,
     output_path: str | None = None,
 ) -> str:
     """
@@ -96,7 +97,8 @@ def save_annotated_frame_image(
     """
     if output_path is None or not output_path.strip():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M_%S")
-        output_path = f"out_image/{timestamp}.jpg"
+        confidence_suffix = "1" if is_match_confident else "0"
+        output_path = f"out_image/{timestamp}_{confidence_suffix}.jpg"
 
     output_file = Path(output_path).expanduser()
     if not output_file.is_absolute():
@@ -379,7 +381,7 @@ async def find_similar_region(
     topk: int = Form(5, description="候选区域数量"),
     iou_threshold: float = Form(0.5, description="候选去重使用的 IoU 阈值"),
     topk_ratio: float = Form(0.6, description="每个候选区域保留的 top-k patch 比例"),
-    score_threshold: float = Form(0.35, description="最佳候选分数阈值"),
+    score_threshold: float = Form(0.45, description="最佳候选分数阈值"),
     margin_threshold: float = Form(0.001, description="top1 与 top2 分差阈值"),
     confidence_iou_threshold: float = Form(0.3, description="可信度判断时用于过滤重复框的 IoU 阈值"),
     save_annotated_image: str = Form("false", description="是否保存画框后的结果图，支持 true/false"),
@@ -448,11 +450,27 @@ async def find_similar_region(
             annotated_image_path = save_annotated_frame_image(
                 frame_image=frame_image,
                 best_box=best_box,
+                is_match_confident=result["match_confidence"]["is_match_confident"],
                 output_path=annotated_output_path,
             )
             save_image_elapsed = perf_counter() - save_image_start_time
         else:
             save_image_elapsed = 0.0
+
+        confidence_info = result["match_confidence"]
+        top1_score = confidence_info["top1_score"]
+        score_gap = None if top1_score is None else float(top1_score - score_threshold)
+        logger.info(
+            "匹配结果摘要 | top1_score=%s | score_threshold=%.6f | score_gap=%s | top2_score=%s | margin=%s | margin_threshold=%.6f | is_match_confident=%s | reason=%s",
+            None if top1_score is None else f"{top1_score:.6f}",
+            score_threshold,
+            None if score_gap is None else f"{score_gap:.6f}",
+            None if confidence_info["top2_score"] is None else f"{confidence_info['top2_score']:.6f}",
+            None if confidence_info["top1_top2_margin"] is None else f"{confidence_info['top1_top2_margin']:.6f}",
+            margin_threshold,
+            confidence_info["is_match_confident"],
+            confidence_info["reason"],
+        )
 
         request_total_elapsed = perf_counter() - request_start_time
         logger.info(

@@ -1,6 +1,4 @@
-...
-这个文件用于测试/dino/find-similar-region接口
-...
+# 这个文件用于测试/dino/find-similar-region接口
 
 import cv2
 import requests
