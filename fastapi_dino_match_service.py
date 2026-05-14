@@ -91,13 +91,13 @@ MATCH_REGION_CACHE: dict[str, dict[str, Any]] = {}
 MATCH_REGION_CACHE_LOCK = Lock()
 SMALL_IMAGE_TOKEN_CACHE: dict[str, dict[str, Any]] = {}
 SMALL_IMAGE_TOKEN_CACHE_LOCK = Lock()
-DEFAULT_ROI_MIN_SIZE = 400
+DEFAULT_ROI_MIN_SIZE = 500
 DEFAULT_ROI_EXPAND_RATIO = 2.5
 DEFAULT_BEST_SCORE_Z_THRESHOLD = 1.0
 DEFAULT_SCALE_CONSISTENCY_IOU_THRESHOLD = 0.3
 DEFAULT_SCALE_SCORE_TOLERANCE = 0.03
-DEFAULT_QUERY_CONSISTENCY_IOU_THRESHOLD = 0.3
-DEFAULT_QUERY_SCORE_TOLERANCE = 0.08
+DEFAULT_QUERY_CONSISTENCY_IOU_THRESHOLD = 0.1
+DEFAULT_QUERY_SCORE_TOLERANCE = 0.11
 DEFAULT_QUERY_BOX_CLUSTER_IOU_THRESHOLD = 0.3
 DEFAULT_LOW_SCORE_CONSENSUS_THRESHOLD = 0.41
 DEFAULT_LOW_SCORE_CONSENSUS_MAX_THRESHOLD = 0.43
@@ -106,6 +106,8 @@ DEFAULT_STRONG_SCORE_MARGIN = 0.08
 DEFAULT_TEMPORAL_CONSISTENCY_IOU_THRESHOLD = 0.3
 DEFAULT_ROI_DIRECT_SCORE_MARGIN = 0.02
 DEFAULT_ROI_DIRECT_TEMPORAL_IOU_THRESHOLD = 0.65
+DEFAULT_ANCHOR_CONSENSUS_SCORE_RELAXATION = 0.10
+DEFAULT_ANCHOR_CONSENSUS_BEST_SCORE_Z_THRESHOLD = 3.0
 
 # 对外返回的核心置信字段：
 # - 只保留业务上真正需要消费的判断结果与关键依据
@@ -397,7 +399,8 @@ def save_annotated_frame_image(
     - 如果调用方未指定输出路径，则默认保存在当前目录下
     """
     if output_path is None or not output_path.strip():
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M_%S")
+    # 文件名精确到微秒，避免高频请求在同一秒内互相覆盖保存结果图
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M_%S_%f")
         confidence_suffix = "1" if is_match_confident else "0"
         output_path = f"out_image/{timestamp}_{confidence_suffix}.jpg"
 
@@ -478,6 +481,42 @@ def save_annotated_frame_image(
         len(normalized_annotated_boxes),
     )
     return str(output_file.resolve())
+
+
+def build_origin_image_output_path(annotated_image_path: str) -> str:
+    """
+    基于画框图路径生成原图输出路径。
+
+    命名规则：
+    - 保持原目录不变
+    - 在文件名后追加 `_origin`
+    - 保留原始扩展名，方便调用方沿用同一套图片读取逻辑
+    """
+    annotated_output_file = Path(annotated_image_path).expanduser().resolve()
+    origin_file_name = f"{annotated_output_file.stem}_origin{annotated_output_file.suffix}"
+    return str(annotated_output_file.with_name(origin_file_name))
+
+
+def save_origin_frame_image(
+    frame_image: Image.Image,
+    annotated_image_path: str,
+) -> str:
+    """
+    按照画框图命名规则额外保存一张原图。
+
+    这样调用方在拿到画框图后，可以通过稳定命名同时获得未画框的原始帧图。
+    """
+    origin_output_path = build_origin_image_output_path(annotated_image_path)
+    origin_output_file = Path(origin_output_path).expanduser().resolve()
+    origin_output_file.parent.mkdir(parents=True, exist_ok=True)
+    frame_image.save(origin_output_file)
+
+    logger.info(
+        "已保存原图: %s | image_name=%s",
+        origin_output_file,
+        origin_output_file.name,
+    )
+    return str(origin_output_file)
 
 
 def crop_roi_around_box(
@@ -907,7 +946,7 @@ def evaluate_roi_direct_acceptance(
     设计目的：
     - ROI 搜索空间更小，局部背景更容易形成“勉强过线”的假阳性
     - 因此 ROI 即使已经满足基础置信规则，也要再过一层更严格的门
-    - 如果这层不过，则回退全图搜索；这样主要影响速度，不会直接损伤召回
+    - 如果这层不过，则触发锚模板重新初始化，避免弱模板全图搜索把结果带偏
     """
     confidence_info = dict(result["match_confidence"])
     top1_score = confidence_info.get("top1_score")
@@ -925,17 +964,48 @@ def evaluate_roi_direct_acceptance(
         temporal_iou is not None
         and float(temporal_iou) >= roi_direct_temporal_iou_threshold
     )
-    is_roi_directly_acceptable = bool(
+    # 常规放行：完整置信判断通过，并且 ROI 内分数或时序连续性足够强。
+    is_regular_roi_directly_acceptable = bool(
         confidence_info["is_match_confident"]
         and (passes_roi_direct_score or passes_roi_direct_temporal)
     )
 
+    # ROI 跟踪阶段的容错放行：
+    # 如果主模板分数很强、目标位置和历史框连续，但仅因为跨模板一致性略抖动失败，
+    # 继续保留 ROI 结果，避免回退到全图后被弱模板带飞。
+    roi_direct_temporal_override_applied = bool(
+        (not confidence_info["is_match_confident"])
+        and passes_roi_direct_score
+        and passes_roi_direct_temporal
+        and bool(confidence_info.get("base_is_match_confident"))
+        and bool(confidence_info.get("is_peak_prominent"))
+    )
+    is_roi_directly_acceptable = bool(
+        is_regular_roi_directly_acceptable or roi_direct_temporal_override_applied
+    )
+    if roi_direct_temporal_override_applied:
+        reason_parts = []
+        original_reason = str(confidence_info.get("reason", ""))
+        if original_reason and original_reason != "ok":
+            reason_parts.append(original_reason)
+        reason_parts.append("roi_direct_temporal_override")
+        confidence_info["reason"] = ",".join(reason_parts)
+
+    final_is_match_confident = bool(
+        confidence_info["is_match_confident"] or roi_direct_temporal_override_applied
+    )
+
     confidence_info.update({
+        "is_match_confident": final_is_match_confident,
+        "base_is_match_confident_before_roi_direct_acceptance": bool(
+            confidence_info["is_match_confident"]
+        ),
         "roi_direct_score_margin": float(roi_direct_score_margin),
         "roi_direct_score_threshold": float(roi_direct_score_threshold),
         "passes_roi_direct_score": passes_roi_direct_score,
         "roi_direct_temporal_iou_threshold": float(roi_direct_temporal_iou_threshold),
         "passes_roi_direct_temporal": passes_roi_direct_temporal,
+        "roi_direct_temporal_override_applied": roi_direct_temporal_override_applied,
         "is_roi_directly_acceptable": is_roi_directly_acceptable,
     })
     result["match_confidence"] = confidence_info
@@ -1222,6 +1292,283 @@ def select_best_result_by_query_box_consensus(
         "ranked_results": ranked_results,
         "cluster_summary": normalized_cluster_summary,
     }
+
+
+def build_anchor_guided_result(
+    anchor_result: dict[str, Any],
+    secondary_results: list[dict[str, Any]],
+    query_image_paths: list[str],
+    query_consistency_iou_threshold: float = DEFAULT_QUERY_CONSISTENCY_IOU_THRESHOLD,
+    query_score_tolerance: float = DEFAULT_QUERY_SCORE_TOLERANCE,
+    anchor_consensus_score_relaxation: float = DEFAULT_ANCHOR_CONSENSUS_SCORE_RELAXATION,
+    anchor_consensus_best_score_z_threshold: float = DEFAULT_ANCHOR_CONSENSUS_BEST_SCORE_Z_THRESHOLD,
+) -> dict[str, Any]:
+    """
+    基于锚模板结果构建“锚框主导”的多模板结果。
+
+    设计原则：
+    - 第一张小图负责决定主框位置
+    - 其他小图只能围绕这个主框做支持验证，不能把最终框拉到别处
+    - 只有与锚框 IoU 和分差同时满足条件的模板，才记为有效支持
+    """
+    anchor_best_match = dict(anchor_result["best_match"])
+    anchor_box = list(anchor_best_match["pixel_box"])
+    anchor_score = float(anchor_best_match["score"])
+    anchor_query_name = str(anchor_result.get("query_image_name", Path(query_image_paths[0]).name))
+
+    ranking_summary: list[dict[str, Any]] = [
+        {
+            "rank": 1,
+            "query_image_name": anchor_query_name,
+            "small_image_path": anchor_result.get("small_image_path"),
+            "best_score": float(anchor_score),
+            "best_score_z": _safe_float(anchor_result["match_confidence"].get("best_score_z"), default=-1.0),
+            "is_match_confident": bool(anchor_result["match_confidence"].get("is_match_confident", False)),
+            "cluster_id": 1,
+            "pixel_box": list(anchor_box),
+            "is_anchor_query": True,
+            "iou_with_anchor": 1.0,
+            "score_gap_to_anchor": 0.0,
+            "is_anchor_aligned": True,
+        }
+    ]
+    aligned_candidate_results: list[dict[str, Any]] = [
+        {
+            "ranking_item": ranking_summary[0],
+            "best_match": anchor_best_match,
+            "source_result": anchor_result,
+        }
+    ]
+
+    query_support_matches: list[dict[str, Any]] = []
+
+    for index, item in enumerate(secondary_results, start=2):
+        best_match = item["best_match"]
+        candidate_box = list(best_match["pixel_box"])
+        candidate_score = float(best_match["score"])
+        overlap = box_iou(anchor_box, candidate_box)
+        score_gap = float(anchor_score - candidate_score)
+        is_anchor_aligned = bool(
+            overlap >= query_consistency_iou_threshold
+            and score_gap <= query_score_tolerance
+        )
+
+        ranking_item = {
+            "rank": int(index),
+            "query_image_name": item["query_image_name"],
+            "small_image_path": item.get("small_image_path"),
+            "best_score": float(candidate_score),
+            "best_score_z": _safe_float(item["match_confidence"].get("best_score_z"), default=-1.0),
+            "is_match_confident": bool(item["match_confidence"].get("is_match_confident", False)),
+            "cluster_id": 1 if is_anchor_aligned else 2,
+            "pixel_box": candidate_box,
+            "is_anchor_query": False,
+            "iou_with_anchor": float(overlap),
+            "score_gap_to_anchor": float(score_gap),
+            "is_anchor_aligned": is_anchor_aligned,
+        }
+        ranking_summary.append(ranking_item)
+
+        if is_anchor_aligned:
+            query_support_matches.append({
+                "query_image_name": item["query_image_name"],
+                "score": float(candidate_score),
+                "score_gap_to_best": float(score_gap),
+                "iou_with_best": float(overlap),
+                "pixel_box": candidate_box,
+            })
+            aligned_candidate_results.append({
+                "ranking_item": ranking_item,
+                "best_match": dict(best_match),
+                "source_result": item,
+            })
+
+    required_query_support = 1 if len(query_image_paths) <= 1 else min(2, len(query_image_paths))
+    # 计数包含锚模板自身，因此从 1 开始。
+    query_support_count = 1 + len(query_support_matches)
+    is_query_consistent = bool(query_support_count >= required_query_support)
+
+    # 复用锚模板的基础置信结果，但把最终多模板一致性改成“围绕锚框验证”。
+    # 首次初始化阶段允许锚模板略低于常规分数阈值，只要峰值足够突出且其它模板都支持同一区域。
+    merged_confidence = dict(anchor_result["match_confidence"])
+    base_is_match_confident = bool(merged_confidence.get("is_match_confident", False))
+    score_threshold = float(merged_confidence.get("score_threshold", 0.0))
+    margin_threshold = float(merged_confidence.get("margin_threshold", 0.0))
+    anchor_consensus_score_threshold = max(
+        0.0,
+        float(score_threshold - anchor_consensus_score_relaxation),
+    )
+    anchor_margin = merged_confidence.get("top1_top2_margin")
+    anchor_best_score_z = _safe_float(merged_confidence.get("best_score_z"), default=-1.0)
+    is_anchor_consensus_score_acceptable = bool(
+        anchor_score >= anchor_consensus_score_threshold
+    )
+    is_anchor_consensus_margin_acceptable = bool(
+        anchor_margin is None or float(anchor_margin) >= margin_threshold
+    )
+    anchor_consensus_override_applied = bool(
+        (not base_is_match_confident)
+        and is_query_consistent
+        and query_support_count >= required_query_support
+        and is_anchor_consensus_score_acceptable
+        and anchor_best_score_z >= float(anchor_consensus_best_score_z_threshold)
+        and is_anchor_consensus_margin_acceptable
+    )
+    final_is_match_confident = bool(
+        (base_is_match_confident and is_query_consistent)
+        or anchor_consensus_override_applied
+    )
+
+    reason_parts: list[str] = []
+    if (
+        merged_confidence.get("reason") not in {None, "", "ok"}
+        and not anchor_consensus_override_applied
+    ):
+        reason_parts.append(str(merged_confidence["reason"]))
+    if not is_query_consistent:
+        reason_parts.append("anchor_query_inconsistent")
+    if not reason_parts:
+        reason_parts.append("ok")
+
+    # 最终框选择策略：
+    # - 锚模板仍然负责先圈定可信区域，避免其它模板在全图范围乱飘
+    # - 但在已经与锚框对齐的候选里，允许分数最高的模板成为最终结果框
+    # - 同步重排 ranking_summary，让红色 rank=1 框始终等于接口返回的 match_box
+    selected_candidate = max(
+        aligned_candidate_results,
+        key=lambda candidate: (
+            float(candidate["ranking_item"]["best_score"]),
+            _safe_float(candidate["ranking_item"].get("best_score_z"), default=-1.0),
+            -int(candidate["ranking_item"]["rank"]),
+        ),
+    )
+    selected_ranking_item = selected_candidate["ranking_item"]
+    selected_best_match = dict(selected_candidate["best_match"])
+    selected_source_result = selected_candidate["source_result"]
+    selected_query_name = str(selected_ranking_item["query_image_name"])
+
+    reordered_ranking_summary = [selected_ranking_item] + [
+        item
+        for item in ranking_summary
+        if item is not selected_ranking_item
+    ]
+    for rank, item in enumerate(reordered_ranking_summary, start=1):
+        item["rank"] = int(rank)
+        item["is_final_match"] = bool(item is selected_ranking_item)
+    ranking_summary = reordered_ranking_summary
+
+    merged_confidence.update({
+        "is_match_confident": final_is_match_confident,
+        "base_is_match_confident_before_query_consistency": base_is_match_confident,
+        "query_support_count": int(query_support_count),
+        "required_query_support": int(required_query_support),
+        "query_consistency_iou_threshold": float(query_consistency_iou_threshold),
+        "query_score_tolerance": float(query_score_tolerance),
+        "is_query_consistent": is_query_consistent,
+        "selected_cluster_support_count": int(query_support_count),
+        "query_support_matches": query_support_matches,
+        "anchor_consensus_score_relaxation": float(anchor_consensus_score_relaxation),
+        "anchor_consensus_score_threshold": float(anchor_consensus_score_threshold),
+        "anchor_consensus_best_score_z_threshold": float(anchor_consensus_best_score_z_threshold),
+        "is_anchor_consensus_score_acceptable": is_anchor_consensus_score_acceptable,
+        "is_anchor_consensus_margin_acceptable": is_anchor_consensus_margin_acceptable,
+        "anchor_consensus_override_applied": anchor_consensus_override_applied,
+        "query_consensus_override_applied": anchor_consensus_override_applied,
+        "low_score_consensus_override_applied": False,
+        "anchor_guided_final_selection_strategy": "highest_score_anchor_aligned",
+        "anchor_query_image_name": anchor_query_name,
+        "anchor_query_score": float(anchor_score),
+        "anchor_query_pixel_box": list(anchor_box),
+        "selected_final_query_image_name": selected_query_name,
+        "selected_final_score": float(selected_best_match["score"]),
+        "selected_final_pixel_box": list(selected_best_match["pixel_box"]),
+        "selected_final_iou_with_anchor": float(selected_ranking_item["iou_with_anchor"]),
+        "anchor_top1_score": merged_confidence.get("top1_score"),
+        "anchor_top2_score": merged_confidence.get("top2_score"),
+        "anchor_top1_top2_margin": merged_confidence.get("top1_top2_margin"),
+        "top1_score": float(selected_best_match["score"]),
+        "reason": ",".join(reason_parts),
+    })
+
+    cluster_summary = [
+        {
+            "cluster_id": 1,
+            "support_count": int(query_support_count),
+            "confident_count": int(
+                sum(
+                    1
+                    for item in ranking_summary
+                    if bool(item["is_match_confident"]) and bool(item["is_anchor_aligned"])
+                )
+            ),
+            "max_best_score_z": float(
+                max(_safe_float(item["best_score_z"], default=-1.0) for item in ranking_summary)
+            ),
+            "sum_best_score_z": float(
+                sum(_safe_float(item["best_score_z"], default=0.0) for item in ranking_summary if bool(item["is_anchor_aligned"]))
+            ),
+            "max_best_score": float(
+                max(float(item["best_score"]) for item in ranking_summary)
+            ),
+            "sum_best_score": float(
+                sum(float(item["best_score"]) for item in ranking_summary if bool(item["is_anchor_aligned"]))
+            ),
+            "query_image_names": [
+                item["query_image_name"] for item in ranking_summary if bool(item["is_anchor_aligned"])
+            ],
+            "representative_box": list(selected_best_match["pixel_box"]),
+            "is_selected": True,
+        }
+    ]
+
+    if any(not bool(item["is_anchor_aligned"]) for item in ranking_summary[1:]):
+        cluster_summary.append({
+            "cluster_id": 2,
+            "support_count": int(sum(1 for item in ranking_summary[1:] if not bool(item["is_anchor_aligned"]))),
+            "confident_count": int(sum(1 for item in ranking_summary[1:] if bool(item["is_match_confident"]) and not bool(item["is_anchor_aligned"]))),
+            "max_best_score_z": float(
+                max(
+                    (_safe_float(item["best_score_z"], default=-1.0) for item in ranking_summary[1:] if not bool(item["is_anchor_aligned"])),
+                    default=-1.0,
+                )
+            ),
+            "sum_best_score_z": float(
+                sum(_safe_float(item["best_score_z"], default=0.0) for item in ranking_summary[1:] if not bool(item["is_anchor_aligned"]))
+            ),
+            "max_best_score": float(
+                max((float(item["best_score"]) for item in ranking_summary[1:] if not bool(item["is_anchor_aligned"])), default=-1.0)
+            ),
+            "sum_best_score": float(
+                sum(float(item["best_score"]) for item in ranking_summary[1:] if not bool(item["is_anchor_aligned"]))
+            ),
+            "query_image_names": [
+                item["query_image_name"] for item in ranking_summary[1:] if not bool(item["is_anchor_aligned"])
+            ],
+            "representative_box": list(
+                next(
+                    (item["pixel_box"] for item in ranking_summary[1:] if not bool(item["is_anchor_aligned"])),
+                    anchor_box,
+                )
+            ),
+            "is_selected": False,
+        })
+
+    merged_result = dict(anchor_result)
+    merged_result["query_image_count"] = len(query_image_paths)
+    merged_result["selection_strategy"] = "anchor_guided_consensus"
+    merged_result["small_image_path"] = selected_ranking_item.get("small_image_path")
+    merged_result["query_image_name"] = selected_query_name
+    merged_result["small_image_size"] = selected_source_result.get(
+        "small_image_size",
+        merged_result.get("small_image_size"),
+    )
+    merged_result["best_match"] = selected_best_match
+    merged_result["top_matches"] = [dict(selected_best_match)]
+    merged_result["confidence_candidates"] = [dict(selected_best_match)]
+    merged_result["ranking_summary"] = ranking_summary
+    merged_result["cluster_summary"] = cluster_summary
+    merged_result["match_confidence"] = merged_confidence
+    return merged_result
 
 
 def get_cached_region(small_image_path: str, frame_size: tuple[int, int]) -> dict[str, Any] | None:
@@ -1603,11 +1950,12 @@ def find_best_similar_region_in_memory(
     confidence_iou_threshold: float = 0.3,
 ) -> dict[str, Any]:
     """
-    在一张大图中同时对比多张小图，并返回分数最高的结果。
+    在一张图中同时对比多张小图，并按框簇共识选择最稳结果。
 
     关键优化：
     - 大图 token 只提取一次
-    - 目录里的多张 query 图共享同一份大图特征
+    - 目录里的多张 query 图共享同一份图像特征
+    - 当前主要用于历史 ROI 内的多模板验证
     """
     if not query_image_paths:
         raise ValueError("query_image_paths 不能为空")
@@ -1825,33 +2173,46 @@ def find_best_similar_region_in_memory(
     return merged_result
 
 
-def find_similar_region_from_cv2_frame(
-    frame: np.ndarray,
-    small_image_path: str,
-    topk: int = 5,
-    iou_threshold: float = 0.6,
-    scales: list[float] | None = None,
-    topk_ratio: float = 0.6,
-    score_threshold: float = 0.35,
-    margin_threshold: float = 0.03,
-    confidence_iou_threshold: float = 0.3,
+def run_anchor_initialized_search(
+    extractor,
+    frame_image: Image.Image,
+    query_image_paths: list[str],
+    topk: int,
+    iou_threshold: float,
+    scales: list[float] | None,
+    topk_ratio: float,
+    score_threshold: float,
+    margin_threshold: float,
+    confidence_iou_threshold: float,
+    roi_expand_ratio: float,
+    roi_min_size: int,
 ) -> dict[str, Any]:
     """
-    直接接收 `cv2.VideoCapture(...).read()` 返回的 frame，并返回最佳匹配框。
+    在“尚无历史缓存”的首次初始化阶段，先用首张模板做全图锚定，再在锚框附近做多模板 ROI 验证。
 
-    适用场景：
-    - 调用方和当前代码在同一个 Python 进程里
-    - 不走 HTTP，只想直接传 numpy.ndarray
+    设计目的：
+    - 避免多张模板在首次全图搜索时各自乱飘，尤其是区分度较弱的小图容易被局部纹理带偏
+    - 先让更稳定的锚模板给出一个候选位置，再让其它模板只在该局部区域内做验证
+    - 最终只基于锚模板 ROI 内的校准结果判断，不再回退到全图多模板搜索
+
+    当前约定：
+    - `query_image_paths` 已按文件名排序，默认第一张图视为锚模板
     """
-    logger.info("收到内存帧匹配请求: small_image_path=%s", small_image_path)
+    if not query_image_paths:
+        raise ValueError("query_image_paths 不能为空")
 
-    extractor = get_feature_extractor()
-    frame_image = convert_cv2_frame_to_rgb_image(frame)
+    anchor_query_image_path = query_image_paths[0]
+    logger.info(
+        "首次初始化启用锚模板策略 | anchor_query=%s | total_queries=%s",
+        anchor_query_image_path,
+        len(query_image_paths),
+    )
 
-    result = find_similar_region_in_memory(
+    # 第一步：仅用锚模板做一次全图搜索，尽量先锁定一个更稳定的候选区域。
+    anchor_result = find_similar_region_in_memory(
         extractor=extractor,
         frame_image=frame_image,
-        query_image_path=small_image_path,
+        query_image_path=anchor_query_image_path,
         topk=topk,
         iou_threshold=iou_threshold,
         scales=scales,
@@ -1860,25 +2221,137 @@ def find_similar_region_from_cv2_frame(
         margin_threshold=margin_threshold,
         confidence_iou_threshold=confidence_iou_threshold,
     )
-
-    best_box = result["best_match"]["pixel_box"]
-    core_match_confidence, debug_match_confidence = split_match_confidence_info(
-        result.get("match_confidence")
+    logger.info(
+        "锚模板全图搜索完成 | anchor_query=%s | best_score=%.6f | is_match_confident=%s | box=%s",
+        Path(anchor_query_image_path).name,
+        float(anchor_result["best_match"]["score"]),
+        anchor_result["match_confidence"]["is_match_confident"],
+        anchor_result["best_match"]["pixel_box"],
     )
-    return {
-        "small_image_path": small_image_path,
-        "frame_size": result["frame_size"],
-        "match_box": {
-            "x1": int(best_box[0]),
-            "y1": int(best_box[1]),
-            "x2": int(best_box[2]),
-            "y2": int(best_box[3]),
-        },
-        "best_score": result["best_match"]["score"],
-        "match_confidence": core_match_confidence,
-        "match_confidence_debug": debug_match_confidence,
-        "timing": result.get("timing"),
+
+    # 即使锚模板本身暂未达到高置信，也继续围绕它的最高分位置做 ROI 校准；
+    # 最终是否放行交给 build_anchor_guided_result 统一判断，避免其它模板重新全图乱飘。
+    if not anchor_result["match_confidence"]["is_match_confident"]:
+        logger.info(
+            "锚模板未通过单模板置信判断，继续围绕锚模板最高分位置做 ROI 校准。 | anchor_query=%s | reason=%s",
+            Path(anchor_query_image_path).name,
+            anchor_result["match_confidence"]["reason"],
+        )
+
+    # 第二步：在锚模板给出的候选区域附近扩一个 ROI，让全部模板只在局部区域做验证。
+    anchor_box = list(anchor_result["best_match"]["pixel_box"])
+    anchor_roi_image, anchor_roi_info = crop_roi_around_box(
+        frame_image=frame_image,
+        center_box=anchor_box,
+        roi_expand_ratio=roi_expand_ratio,
+        roi_min_size=roi_min_size,
+    )
+    logger.info(
+        "锚模板初始化 ROI | anchor_query=%s | anchor_box=%s | roi=(%s,%s,%s,%s) | roi_size=(%s,%s)",
+        Path(anchor_query_image_path).name,
+        anchor_box,
+        anchor_roi_info["left"],
+        anchor_roi_info["top"],
+        anchor_roi_info["right"],
+        anchor_roi_info["bottom"],
+        anchor_roi_info["width"],
+        anchor_roi_info["height"],
+    )
+
+    # 第二步改为“锚模板主导”的局部校准：
+    # - 最终主框固定使用锚模板全图搜到的框
+    # - 其它模板只允许在锚框附近 ROI 内做局部搜索，并用来判断是否支持该锚框
+    # - 不再让其它模板重新决定最终主框，避免再次被弱模板带偏
+    secondary_query_results: list[dict[str, Any]] = []
+    secondary_query_paths = query_image_paths[1:]
+    for index, secondary_query_image_path in enumerate(secondary_query_paths, start=1):
+        secondary_query_name = Path(secondary_query_image_path).name
+        secondary_query_start_time = perf_counter()
+        logger.info(
+            "开始处理锚模板局部校准图 %s / %s: %s",
+            index,
+            len(secondary_query_paths),
+            secondary_query_image_path,
+        )
+
+        try:
+            secondary_result = find_similar_region_in_memory(
+                extractor=extractor,
+                frame_image=anchor_roi_image,
+                query_image_path=secondary_query_image_path,
+                topk=topk,
+                iou_threshold=iou_threshold,
+                scales=scales,
+                topk_ratio=topk_ratio,
+                score_threshold=score_threshold,
+                margin_threshold=margin_threshold,
+                confidence_iou_threshold=confidence_iou_threshold,
+            )
+            secondary_result["small_image_path"] = str(
+                Path(secondary_query_image_path).resolve()
+            )
+            secondary_result["query_image_name"] = secondary_query_name
+            secondary_result = apply_roi_offset_to_result(
+                result=secondary_result,
+                offset_x=anchor_roi_info["left"],
+                offset_y=anchor_roi_info["top"],
+            )
+            secondary_result["frame_size"] = {
+                "width": frame_image.size[0],
+                "height": frame_image.size[1],
+            }
+            secondary_query_results.append(secondary_result)
+            logger.info(
+                "锚模板局部校准图处理完成 | query=%s | best_score=%.6f | is_match_confident=%s | elapsed=%.3fs | box=%s",
+                secondary_query_name,
+                float(secondary_result["best_match"]["score"]),
+                secondary_result["match_confidence"]["is_match_confident"],
+                perf_counter() - secondary_query_start_time,
+                secondary_result["best_match"]["pixel_box"],
+            )
+        except Exception:
+            logger.exception(
+                "锚模板局部校准图处理失败: %s",
+                secondary_query_image_path,
+            )
+
+    anchor_result["small_image_path"] = str(Path(anchor_query_image_path).resolve())
+    anchor_result["query_image_name"] = Path(anchor_query_image_path).name
+    anchor_result["frame_size"] = {
+        "width": frame_image.size[0],
+        "height": frame_image.size[1],
     }
+    roi_validation_result = build_anchor_guided_result(
+        anchor_result=anchor_result,
+        secondary_results=secondary_query_results,
+        query_image_paths=query_image_paths,
+    )
+    roi_validation_result["initialization_strategy"] = "anchor_roi_validation"
+    roi_validation_result["anchor_query_image_name"] = Path(anchor_query_image_path).name
+    roi_validation_result["anchor_query_best_match"] = {
+        "score": float(anchor_result["best_match"]["score"]),
+        "pixel_box": list(anchor_box),
+    }
+    roi_validation_result["anchor_roi_info"] = dict(anchor_roi_info)
+    logger.info(
+        "锚模板 ROI 局部校准完成 | anchor_query=%s | final_is_match_confident=%s | selected_query=%s | top1_score=%s | query_support=%s/%s | reason=%s",
+        Path(anchor_query_image_path).name,
+        roi_validation_result["match_confidence"]["is_match_confident"],
+        roi_validation_result.get("query_image_name"),
+        roi_validation_result["match_confidence"].get("top1_score"),
+        roi_validation_result["match_confidence"].get("query_support_count"),
+        roi_validation_result["match_confidence"].get("required_query_support"),
+        roi_validation_result["match_confidence"].get("reason"),
+    )
+
+    if not roi_validation_result["match_confidence"]["is_match_confident"]:
+        logger.info(
+            "锚模板 ROI 局部校准未通过，本次初始化不写入 ROI 缓存。 | anchor_query=%s | reason=%s",
+            Path(anchor_query_image_path).name,
+            roi_validation_result["match_confidence"]["reason"],
+        )
+
+    return roi_validation_result
 
 
 def summarize_load_small_image_elapsed(result_timing: dict[str, Any] | None) -> float:
@@ -1920,17 +2393,22 @@ def health_check() -> dict[str, str]:
 async def find_similar_region(
     frame_file: UploadFile = File(..., description="视频帧图片文件，建议由 cv2.imencode 后上传"),
     small_image_path: str | None = Form(None, description="待查找的小图本地路径，与 small_image_dir 二选一"),
-    small_image_dir: str | None = Form('./chen', description="待查找的小图目录路径，与 small_image_path 二选一"),
-    scales: str = Form("1.0,1.2", description="多尺度列表，逗号分隔"),
+    small_image_dir: str | None = Form('./chen2', description="待查找的小图目录路径，与 small_image_path 二选一"),
+    scales: str = Form("0.8,1.0,1.2", description="多尺度列表，逗号分隔"),
     topk: int = Form(5, description="候选区域数量"),
-    iou_threshold: float = Form(0.6, description="候选去重使用的 IoU 阈值"),
+    iou_threshold: float = Form(0.8, description="候选去重使用的 IoU 阈值"),
     topk_ratio: float = Form(0.6, description="每个候选区域保留的 top-k patch 比例"),
     score_threshold: float = Form(0.5, description="最佳候选分数阈值"),
     margin_threshold: float = Form(0.001, description="top1 与 top2 分差阈值"),
-    confidence_iou_threshold: float = Form(0.3, description="可信度判断时用于过滤重复框的 IoU 阈值"),
+    confidence_iou_threshold: float = Form(0.5, description="可信度判断时用于过滤重复框的 IoU 阈值"),
     roi_expand_ratio: float = Form(DEFAULT_ROI_EXPAND_RATIO, description="命中历史高置信框后，ROI 相对目标框宽高的扩展倍数"),
     roi_min_size: int = Form(DEFAULT_ROI_MIN_SIZE, description="ROI 的最小宽高，单位像素"),
-    save_annotated_image: str = Form("false", description="是否保存画框后的结果图，支持 true/false"),
+    disable_history_roi_cache: str = Form(
+        "false",
+        description="是否禁用历史高置信 ROI 缓存搜索；true 时跳过历史 ROI，始终全图搜索，且不更新缓存",
+    ),
+    save_annotated_image: str = Form("true", description="是否保存画框后的结果图，支持 true/false"),
+    save_origin_image: str = Form("true", description="是否在保存画框图时额外保存一张原图，文件名后追加 _origin"),
     annotated_output_path: str | None = Form(None, description="画框结果图输出路径；未传时使用默认文件名"),
 ) -> dict[str, Any]:
     """
@@ -1941,12 +2419,13 @@ async def find_similar_region(
     - small_image_path / small_image_dir: 单图路径或小图目录，二选一
     """
     logger.info(
-        "收到相似区域查找请求: frame_file=%s, small_image_path=%s, small_image_dir=%s, roi_expand_ratio=%.3f, roi_min_size=%s",
+        "收到相似区域查找请求: frame_file=%s, small_image_path=%s, small_image_dir=%s, roi_expand_ratio=%.3f, roi_min_size=%s, disable_history_roi_cache=%s",
         frame_file.filename,
         small_image_path,
         small_image_dir,
         roi_expand_ratio,
         roi_min_size,
+        disable_history_roi_cache,
     )
 
     extractor = get_feature_extractor()
@@ -1985,11 +2464,16 @@ async def find_similar_region(
         )
 
         parsed_scales = parse_scales(scales)
+        disable_history_roi_cache_flag = parse_bool_value(disable_history_roi_cache)
         frame_size = frame_image.size
-        cached_region = get_cached_region(
-            small_image_path=cache_key,
-            frame_size=frame_size,
-        )
+        cached_region = None
+        if disable_history_roi_cache_flag:
+            logger.info("当前请求禁用历史 ROI 缓存，直接执行全图搜索，且不读写缓存。")
+        else:
+            cached_region = get_cached_region(
+                small_image_path=cache_key,
+                frame_size=frame_size,
+            )
 
         match_start_time = perf_counter()
         search_strategy = "full_frame"
@@ -2075,7 +2559,7 @@ async def find_similar_region(
             else:
                 roi_fallback_triggered = True
                 logger.info(
-                    "ROI 搜索未达到直接放行条件，回退到全图搜索。 | is_match_confident=%s | is_roi_directly_acceptable=%s | top1_score=%s | roi_direct_score_threshold=%s | temporal_iou=%s | roi_direct_temporal_threshold=%s",
+                    "ROI 搜索未达到直接放行条件，改用锚模板重新初始化。 | is_match_confident=%s | is_roi_directly_acceptable=%s | top1_score=%s | roi_direct_score_threshold=%s | temporal_iou=%s | roi_direct_temporal_threshold=%s",
                     roi_result["match_confidence"]["is_match_confident"],
                     roi_result["match_confidence"].get("is_roi_directly_acceptable"),
                     roi_result["match_confidence"].get("top1_score"),
@@ -2083,7 +2567,9 @@ async def find_similar_region(
                     roi_result["match_confidence"].get("temporal_iou_with_cached_box"),
                     roi_result["match_confidence"].get("roi_direct_temporal_iou_threshold"),
                 )
-                result = find_best_similar_region_in_memory(
+                # 缓存 ROI 失效时，只允许首张锚模板重新全图定位；
+                # 其它模板仍然只在锚框临时 ROI 内做验证，避免弱模板把结果拉到全图其它位置。
+                result = run_anchor_initialized_search(
                     extractor=extractor,
                     frame_image=frame_image,
                     query_image_paths=query_image_paths,
@@ -2094,15 +2580,13 @@ async def find_similar_region(
                     score_threshold=score_threshold,
                     margin_threshold=margin_threshold,
                     confidence_iou_threshold=confidence_iou_threshold,
+                    roi_expand_ratio=roi_expand_ratio,
+                    roi_min_size=roi_min_size,
                 )
-                result = apply_temporal_consistency_to_result(
-                    result=result,
-                    reference_box=cached_region["pixel_box"],
-                )
-                search_strategy = "roi_fallback_full_frame"
+                search_strategy = "roi_fallback_anchor_reinitialize"
         else:
-            logger.info("未命中历史高置信缓存，直接执行全图搜索。")
-            result = find_best_similar_region_in_memory(
+            logger.info("未命中历史高置信缓存，先执行锚模板初始化搜索。")
+            result = run_anchor_initialized_search(
                 extractor=extractor,
                 frame_image=frame_image,
                 query_image_paths=query_image_paths,
@@ -2113,14 +2597,20 @@ async def find_similar_region(
                 score_threshold=score_threshold,
                 margin_threshold=margin_threshold,
                 confidence_iou_threshold=confidence_iou_threshold,
+                roi_expand_ratio=roi_expand_ratio,
+                roi_min_size=roi_min_size,
             )
+            search_strategy = str(result.get("initialization_strategy", "anchor_initialized_full_frame"))
 
         match_elapsed = perf_counter() - match_start_time
 
         best_box = result["best_match"]["pixel_box"]
         should_save_annotated_image = parse_bool_value(save_annotated_image)
+        should_save_origin_image = parse_bool_value(save_origin_image)
         annotated_image_path = None
         annotated_image_name = None
+        origin_image_path = None
+        origin_image_name = None
         if should_save_annotated_image:
             save_image_start_time = perf_counter()
             annotated_boxes = result.get("ranking_summary")
@@ -2138,6 +2628,18 @@ async def find_similar_region(
                 annotated_image_name,
                 annotated_image_path,
             )
+
+            if should_save_origin_image:
+                origin_image_path = save_origin_frame_image(
+                    frame_image=frame_image,
+                    annotated_image_path=annotated_image_path,
+                )
+                origin_image_name = Path(origin_image_path).name
+                logger.info(
+                    "原图文件名: %s | origin_image_path=%s",
+                    origin_image_name,
+                    origin_image_path,
+                )
         else:
             save_image_elapsed = 0.0
 
@@ -2150,16 +2652,19 @@ async def find_similar_region(
         top1_score = confidence_info["top1_score"]
         score_gap = None if top1_score is None else float(top1_score - score_threshold)
 
-        if confidence_info["is_match_confident"]:
+        if confidence_info["is_match_confident"] and not disable_history_roi_cache_flag:
             update_cached_region(
                 small_image_path=cache_key,
                 frame_size=frame_size,
                 pixel_box=best_box,
             )
+        elif confidence_info["is_match_confident"] and disable_history_roi_cache_flag:
+            logger.info("当前请求禁用了历史 ROI 缓存，本次高置信结果不写入缓存。")
 
         logger.info(
-            "匹配结果摘要 | strategy=%s | roi_fallback_triggered=%s | top1_score=%s | score_threshold=%.6f | score_gap=%s | top2_score=%s | margin=%s | margin_threshold=%.6f | best_score_z=%s | scale_support=%s/%s | scale_override=%s | query_support=%s/%s | selected_cluster_support=%s | query_override=%s | low_score_consensus_threshold=%s | low_score_consensus_max_threshold=%s | low_score_consensus_z_threshold=%s | low_score_consensus_override=%s | temporal_iou=%s | temporal_override=%s | roi_direct_ok=%s | roi_direct_score_threshold=%s | roi_direct_temporal_threshold=%s | is_match_confident=%s | reason=%s | annotated_image_name=%s",
+            "匹配结果摘要 | strategy=%s | disable_history_roi_cache=%s | roi_fallback_triggered=%s | top1_score=%s | score_threshold=%.6f | score_gap=%s | top2_score=%s | margin=%s | margin_threshold=%.6f | best_score_z=%s | scale_support=%s/%s | scale_override=%s | query_support=%s/%s | selected_cluster_support=%s | query_override=%s | low_score_consensus_threshold=%s | low_score_consensus_max_threshold=%s | low_score_consensus_z_threshold=%s | low_score_consensus_override=%s | temporal_iou=%s | temporal_override=%s | roi_direct_ok=%s | roi_direct_score_threshold=%s | roi_direct_temporal_threshold=%s | is_match_confident=%s | reason=%s | annotated_image_name=%s",
             search_strategy,
+            disable_history_roi_cache_flag,
             roi_fallback_triggered,
             None if top1_score is None else f"{top1_score:.6f}",
             score_threshold,
@@ -2215,7 +2720,10 @@ async def find_similar_region(
             "match_confidence_debug": debug_match_confidence,
             "annotated_image_saved": should_save_annotated_image,
             "annotated_image_path": annotated_image_path,
+            "origin_image_saved": bool(origin_image_path),
+            "origin_image_path": origin_image_path,
             "search_strategy": search_strategy,
+            "disable_history_roi_cache": disable_history_roi_cache_flag,
             "roi_fallback_triggered": roi_fallback_triggered,
             "roi_config": {
                 "roi_expand_ratio": float(roi_expand_ratio),
